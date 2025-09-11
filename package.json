@@ -1,0 +1,37 @@
+{
+  "name": "playwright-test-project",
+  "version": "1.0.0",
+  "description": "A Playwright test automation project",
+  "main": "index.js",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:ui": "playwright test --ui",
+    "test:debug": "playwright test --debug",
+    "test:report": "playwright show-report",
+    "install-browsers": "playwright install",
+    "codegen": "playwright codegen",
+    "check-vpn": "node check-vpn.js",
+    "visit-emed": "playwright test tests/simple-visit.spec.js --headed",
+    "test-system": "node test-system-browser.js",
+    "test-vpn": "node playwright-with-vpn.js",
+    "test-extension": "node playwright-with-extension.js",
+    "test-proxy": "node playwright-free-proxy.js",
+    "test:nord-us": "scripts/nordvpn-run.sh --country US -- npx playwright test --headed",
+    "check-ip:nord": "scripts/nordvpn-run.sh --country US -- npx playwright test tests/vpn-check.spec.js --headed"
+  },
+  "keywords": [
+    "playwright",
+    "testing",
+    "automation"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@playwright/test": "^1.40.0",
+    "@types/node": "^20.0.0"
+  },
+  "dependencies": {
+    "xlsx": "^0.18.5"
+  }
+}
