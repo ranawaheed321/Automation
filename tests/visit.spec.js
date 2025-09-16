@@ -99,33 +99,33 @@ function getHPIFromExcelOrEnv() {
   }
 }
 
-function getProviderFromExcelOrEnv() {
-  if (process.env.PROVIDER) return String(process.env.PROVIDER);
-  try {
-    const XLSX = require('xlsx');
-    const candidates = [];
-    if (process.env.DATA_FILE) candidates.push(process.env.DATA_FILE);
-    if (process.env.PATIENT_FILE) candidates.push(process.env.PATIENT_FILE);
-    candidates.push(path.resolve(__dirname, './data/dynamicdata.xlsx'));
-    candidates.push(path.resolve(__dirname, '../data/dynamicdata.xlsx'));
-    const filePath = candidates.find(p => { try { return fs.existsSync(p); } catch { return false; } });
-    if (!filePath) throw new Error(`Data file not found. Tried: ${candidates.join(' | ')}`);
-    const workbook = XLSX.readFile(filePath);
-    const sheetName = process.env.DATA_SHEET || process.env.PATIENT_SHEET || workbook.SheetNames[0];
-    const sheet = workbook.Sheets[sheetName];
-    if (!sheet) throw new Error(`Sheet not found: ${sheetName}`);
-    const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
-    if (rows && rows.length > 0) {
-      const first = rows[0];
-      const keys = Object.keys(first);
-      const providerKey = keys.find(k => k.trim().toLowerCase() === 'provider');
-      if (providerKey && String(first[providerKey]) !== '') return String(first[providerKey]);
-    }
-    throw new Error('Provider column is missing or empty in the first row');
-  } catch (e) {
-    throw new Error(`Failed to read Provider from Excel: ${e.message}`);
-  }
-}
+// function getProviderFromExcelOrEnv() {
+//   if (process.env.PROVIDER) return String(process.env.PROVIDER);
+//   try {
+//     const XLSX = require('xlsx');
+//     const candidates = [];
+//     if (process.env.DATA_FILE) candidates.push(process.env.DATA_FILE);
+//     if (process.env.PATIENT_FILE) candidates.push(process.env.PATIENT_FILE);
+//     candidates.push(path.resolve(__dirname, './data/dynamicdata.xlsx'));
+//     candidates.push(path.resolve(__dirname, '../data/dynamicdata.xlsx'));
+//     const filePath = candidates.find(p => { try { return fs.existsSync(p); } catch { return false; } });
+//     if (!filePath) throw new Error(`Data file not found. Tried: ${candidates.join(' | ')}`);
+//     const workbook = XLSX.readFile(filePath);
+//     const sheetName = process.env.DATA_SHEET || process.env.PATIENT_SHEET || workbook.SheetNames[0];
+//     const sheet = workbook.Sheets[sheetName];
+//     if (!sheet) throw new Error(`Sheet not found: ${sheetName}`);
+//     const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+//     if (rows && rows.length > 0) {
+//       const first = rows[0];
+//       const keys = Object.keys(first);
+//       const providerKey = keys.find(k => k.trim().toLowerCase() === 'provider');
+//       if (providerKey && String(first[providerKey]) !== '') return String(first[providerKey]);
+//     }
+//     throw new Error('Provider column is missing or empty in the first row');
+//   } catch (e) {
+//     throw new Error(`Failed to read Provider from Excel: ${e.message}`);
+//   }
+// }
 
 function getEncounterTypeFromExcelOrEnv() {
   if (process.env.ENCOUNTER_TYPE) return String(process.env.ENCOUNTER_TYPE);
@@ -263,6 +263,16 @@ function formatEncounterDateForInput(raw) {
   return `${m}/${d}/${y}`; // Site expects MM/DD/YYYY
 }
 
+function buildFlexibleProviderRegex(name) {
+  const raw = String(name || '').trim();
+  if (!raw) return /.+/;
+  // Escape regex specials
+  const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Allow commas or spaces between tokens (e.g., "JOEL MOLINA APRN" vs "JOEL MOLINA, APRN")
+  const pattern = escaped.replace(/\s+/g, '[\\s,]*');
+  return new RegExp(pattern, 'i');
+}
+
 function writeTestResultToExcel(status) {
   try {
     const XLSX = require('xlsx');
@@ -304,48 +314,47 @@ test('visit emedpractice loads under VPN', async ({ page }) => {
   const log = (msg) => console.log(`[visit] ${msg}`);
   const recordIdValue = getAccountOrPatientIdFromExcelOrEnv();
   const planCommunicationText = getPlanCommunicationFromExcelOrEnv();
-  const providerText = getProviderFromExcelOrEnv();
+  let providerText = '';
   const encounterTypeText = getEncounterTypeFromExcelOrEnv();
   const visitTemplateTypeText = getVisitTemplateTypeFromExcelOrEnv();
   const encounterDateText = getEncounterDateFromExcelOrEnv();
+  let appointmentTypeText = '';
+  let appointmentDateText = '';
   await page.goto('https://service.emedpractice.com/', {
     waitUntil: 'domcontentloaded',
     timeout: 60000
   });
 
   await page.waitForTimeout(5000);
-  await page.locator('input[placeholder*="User" i]').fill('QHSisp25');
-  await page.locator('input[placeholder*="Password" i]').fill('MedViz@2050');
-  await page.locator('input[type="image"]').click();
-  await page.waitForTimeout(2000);
-  await page.locator('//*[starts-with(@class, "btn btn-success")]').click();
-  await page.waitForTimeout(2000);
-  await page.locator('//*[starts-with(@class, "sf-with-ul")][contains(normalize-space(.), "Patients")]').click();
-  await page.waitForTimeout(1000);
+  const { LoginPage } = require('./pages/LoginPage');
+  const loginPage = new LoginPage(page);
   const content = page.frameLocator('iframe[name="contentframe"]');
-// Wait for and fill Patient ID in the correct frame
-{
-  const patientIdSelector = '#_ctl0_ContentPlaceHolder1_txtPatientID';
-  await content.locator(patientIdSelector).waitFor({ state: 'visible', timeout: 30000 });
-  await content.locator(patientIdSelector).click();
-  await content.locator(patientIdSelector).fill(recordIdValue);
-  await page.waitForTimeout(4000);
-}
-// Wait for and click Search button in the correct frame
-{
-  const searchBtn = '#_ctl0_ContentPlaceHolder1_btnSearch';
-  
-  log('Waiting for Search button to be visible...');
-  await content.locator(searchBtn).waitFor({ state: 'visible', timeout: 30000 });
-  await content.locator(searchBtn).click({ timeout: 30000 });
-  
-  log('Waiting for patient grid...');
-  const patientRow = '#_ctl0_ContentPlaceHolder1_gvCurrentPatient__ctl2_selectedPatientID';
-  await content.locator(patientRow).waitFor({ state: 'visible', timeout: 30000 });
-  await content.locator(patientRow).click({ timeout: 30000 });
-  await page.waitForTimeout(3000);
-}
-
+  await loginPage.login();
+  await page.waitForTimeout(2000);
+  const searchInput = page.locator('#txtSearch');
+  await searchInput.waitFor({ state: 'visible', timeout: 20000 });
+  await searchInput.click();
+  await searchInput.fill(recordIdValue, { delay: 10 });
+  // Prefer selecting from autocomplete menu (avoids the UI replacing input with patient name)
+  let clickedSuggestion = false;
+  {
+    const menu = page.locator('ul.ui-autocomplete.ui-front').first();
+    await menu.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+    if (await menu.isVisible().catch(() => false)) {
+      const matchCell = menu.locator(`div.width60.textEllipsis[title="${recordIdValue}"]`).first();
+      if (await matchCell.count()) {
+        await matchCell.locator('xpath=ancestor::a[1]').click({ timeout: 5000 }).catch(async () => {
+          await matchCell.click({ timeout: 5000, force: true }).catch(() => {});
+        });
+        clickedSuggestion = true;
+      }
+    }
+  }
+  if (!clickedSuggestion) {
+    // Fallback: trigger search via Enter if no menu appeared
+    await page.keyboard.press('Enter');
+  }
+  await page.waitForTimeout(5000);
 // Wait for and click Appointments tab in the correct frame
 {
   const appointmentsXPath = '//*[starts-with(@class, "ui-tab-Txt")][contains(text(), "Appointments")]';
@@ -362,6 +371,65 @@ test('visit emedpractice loads under VPN', async ({ page }) => {
     await tab.click({ timeout: 30000 });
   }
   await page.waitForTimeout(2000);
+}
+// After opening Appointments, read the Appointment Type from the first data row (td[7] is "Office Visit")
+{
+  try {
+    // Prefer exact grid id; target first tbody row, 7th cell
+    let cell = content.locator('xpath=//*[@id="_ctl0_ContentPlaceHolder1_gvAppointments"]/tbody/tr[1]/td[7]').first();
+    if (!(await cell.count().catch(() => 0))) {
+      // Fallback: any grid whose id contains gvAppointments
+      cell = content.locator('xpath=//table[contains(@id, "gvAppointments")]/tbody/tr[1]/td[7]').first();
+    }
+    await cell.waitFor({ state: 'visible', timeout: 15000 });
+    const text = (await cell.textContent()).trim();
+    if (text) {
+      appointmentTypeText = text;
+      log(`Appointment Type detected: ${appointmentTypeText}`);
+    } else {
+      log('Appointment Type cell was empty');
+    }
+  } catch (e) {
+    log(`Failed to read Appointment Type: ${e.message}`);
+  }
+}
+// Also read Appointment Date from the first data row (td[4])
+{
+  try {
+    let dateCell = content.locator('xpath=//*[@id="_ctl0_ContentPlaceHolder1_gvAppointments"]/tbody/tr[1]/td[4]').first();
+    if (!(await dateCell.count().catch(() => 0))) {
+      dateCell = content.locator('xpath=//table[contains(@id, "gvAppointments")]/tbody/tr[1]/td[4]').first();
+    }
+    await dateCell.waitFor({ state: 'visible', timeout: 15000 });
+    const raw = (await dateCell.textContent()).trim();
+    if (raw) {
+      appointmentDateText = raw;
+      log(`Appointment Date detected: ${appointmentDateText}`);
+    } else {
+      log('Appointment Date cell was empty');
+    }
+  } catch (e) {
+    log(`Failed to read Appointment Date: ${e.message}`);
+  }
+}
+// Read Physician/Scheduler Name from the first data row (td[3]) to use as provider
+{
+  try {
+    let providerCell = content.locator('xpath=//*[@id="_ctl0_ContentPlaceHolder1_gvAppointments"]/tbody/tr[1]/td[3]').first();
+    if (!(await providerCell.count().catch(() => 0))) {
+      providerCell = content.locator('xpath=//table[contains(@id, "gvAppointments")]/tbody/tr[1]/td[3]').first();
+    }
+    await providerCell.waitFor({ state: 'visible', timeout: 15000 });
+    const text = (await providerCell.textContent()).trim();
+    if (text) {
+      providerText = text;
+      log(`Provider detected from grid: ${providerText}`);
+    } else {
+      log('Provider cell was empty');
+    }
+  } catch (e) {
+    log(`Failed to read Provider from grid: ${e.message}`);
+  }
 }
 // Wait until Appointments tab is visible, then click (prefer parent anchor), frame-aware
 
@@ -445,11 +513,30 @@ await page.waitForTimeout(5000);
         
         // Wait for dropdown to activate and select first option
         log('Waiting for dropdown options...');
-        // Look for the specific provider option from Excel
-        const providerOption = frame.locator('.chosen-results li', { hasText: providerText }).first();
-        await providerOption.waitFor({ state: 'visible', timeout: 10000 });
-        log(`Selecting ${providerText}...`);
-        await providerOption.click();
+        // Look for the specific provider option from grid with flexible comma/space matching
+        const providerRegex = buildFlexibleProviderRegex(providerText);
+        const options = frame.locator('.chosen-results li');
+        await options.first().waitFor({ state: 'visible', timeout: 10000 });
+        const count = await options.count();
+        let clickedProvider = false;
+        for (let i = 0; i < count; i++) {
+          const item = options.nth(i);
+          const txt = (await item.textContent()).trim();
+          if (providerRegex.test(txt)) {
+            log(`Selecting provider match: ${txt}`);
+            await item.click();
+            clickedProvider = true;
+            break;
+          }
+        }
+        if (!clickedProvider) {
+          // Fallback: try exact contains with and without comma
+          const alt1 = frame.locator('.chosen-results li', { hasText: providerText }).first();
+          const alt2 = frame.locator('.chosen-results li', { hasText: providerText.replace(/\s+APRN/i, ', APRN') }).first();
+          if (await alt1.count()) { await alt1.click().catch(() => {}); }
+          else if (await alt2.count()) { await alt2.click().catch(() => {}); }
+          else throw new Error(`Provider option not found for: ${providerText}`);
+        }
         // After selecting provider, wait and fill the date field
         await page.waitForTimeout(5000);
         try {
@@ -457,8 +544,9 @@ await page.waitForTimeout(5000);
           await dateInput.waitFor({ state: 'visible', timeout: 10000 });
           await dateInput.click({ timeout: 5000 }).catch(() => {});
           await dateInput.fill('');
-          const formattedDate = formatEncounterDateForInput(encounterDateText);
-          await dateInput.type(formattedDate, { delay: 10 });
+          const dateSource = appointmentDateText || encounterDateText;
+          const formattedDate = formatEncounterDateForInput(dateSource);
+          await dateInput.fill(formattedDate, { delay: 10 });
         } catch (e) {
           log(`Date fill after provider failed: ${e.message}`);
         }
@@ -731,7 +819,7 @@ if (!targetFrame) throw new Error('Target textarea #txtsnomed_search not found a
 // now fill only the intended field
 const snomed = targetFrame.locator('#txtsnomed_search.ui-autocomplete-input');
 await snomed.waitFor({ state: 'visible', timeout: 15000 });
-await snomed.fill('QHS IC');
+await snomed.fill(appointmentTypeText);
 await page.waitForTimeout(6000);
 // Click Save after filling (prefer #btnAddProblem, fallback to visible Save buttons)
 // After filling:

@@ -1,0 +1,85 @@
+{
+  "cookies": [
+    {
+      "name": "api",
+      "value": "N",
+      "domain": "service.emedpractice.com",
+      "path": "/",
+      "expires": -1,
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "BrowserID",
+      "value": "f30833db-5843-474f-a9e2-de9d2f917c8b",
+      "domain": "service.emedpractice.com",
+      "path": "/",
+      "expires": 1758008395,
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "Server_Session_Cookie",
+      "value": "rs36|aMkTB",
+      "domain": "service.emedpractice.com",
+      "path": "/",
+      "expires": -1,
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "ASP.NET_SessionId",
+      "value": "4anhbuqljrt4thhxzbmssdh2",
+      "domain": "service.emedpractice.com",
+      "path": "/",
+      "expires": -1,
+      "httpOnly": true,
+      "secure": false,
+      "sameSite": "Lax"
+    },
+    {
+      "name": ".ASPXAUTH",
+      "value": "0B531FAF288D9C33BBFC785385BEBD05B2CBBC646ECE50FEE4B8EC3087743D1117B4BA70F43A8E324ACDB3F1F2EBE822B7540B4D353DEF7BB872A056FEC5D260BB73B4E6006F068C428380A56B2C500AA1637B8F4285D62AF1BFD59739AD837E",
+      "domain": "service.emedpractice.com",
+      "path": "/",
+      "expires": 1758009866.754435,
+      "httpOnly": true,
+      "secure": false,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "portalroles",
+      "value": "89B1F0269E601C6BF625C493AE522C845D58CDEAC15377F59290D3FB56F8FC57ACD7F9CC2C83ED2D25EFF82874C7A5DB78E8C6A2716F208EDC36DF3475B8708FFAEAD059003BE67062C943662595B327E56DF1ED7346871A6F4A232BFDCE7A0A54BF7BE5B7BD2611E08227951241DAD726D7DE15F51B3047D80BB336E629235F735721A9F7473BEB89230CD54C382B9EA0B500570FB0D9BD5ACDFDD58D9716F1DA0184B85F0289C016B14CDF005F305CB30679CF0ED04A4A706FD9711C984689B521ECCC5051361141BD5E91A3D339C978D5B042712F45E5DFF8A2AEDC71FF46BDC899B20426A978794AF1DEE1A3856B501D94124F000EEAAF41974DE6607D58D243B245C13F9F444B389CBE1B1E4C7DC7FC840BDCBA68E7C916F092DD72F8FCB4A07E171F487709D6FF98FEEB7B1BF5F82926A36D7F3F53A5D5CA73D3DE7D3438C41F02C04527F6F7CE209F86AE0C89D7863CBD44643A8FF720CD200FD3E9CE",
+      "domain": "service.emedpractice.com",
+      "path": "/",
+      "expires": 1758011666.754512,
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "TabID",
+      "value": "7f6edd82-a436-4eda-9dc2-d01c2ee4a0e1",
+      "domain": "service.emedpractice.com",
+      "path": "/",
+      "expires": 1758008186.754585,
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "lat",
+      "value": "2025-09-16 07:34:28",
+      "domain": ".emedpractice.com",
+      "path": "/",
+      "expires": -1,
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "Lax"
+    }
+  ],
+  "origins": []
+}
