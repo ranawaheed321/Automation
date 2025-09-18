@@ -1,6 +1,7 @@
 const { test } = require('@playwright/test');
 const path = require('path');
 const fs = require('fs');
+let currentRecordIdValue = null;
 
 function getAccountOrPatientIdFromExcelOrEnv() {
   if (process.env.ACCOUNT_ID) return String(process.env.ACCOUNT_ID);
@@ -273,7 +274,7 @@ function buildFlexibleProviderRegex(name) {
   return new RegExp(pattern, 'i');
 }
 
-function writeTestResultToExcel(status) {
+function writeResultForCurrentRecord(status) {
   try {
     const XLSX = require('xlsx');
     const candidates = [];
@@ -290,10 +291,31 @@ function writeTestResultToExcel(status) {
     const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
     if (!rows || rows.length === 0) { console.warn('Result write skipped: sheet has no rows'); return; }
     const header = Array.isArray(rows[0]) ? rows[0] : [];
-    let colIndex = header.findIndex(h => String(h).trim().toLowerCase() === 'result' || String(h).trim().toLowerCase() === 'status');
-    if (colIndex === -1) { colIndex = header.length; header[colIndex] = 'Result'; rows[0] = header; }
-    if (!rows[1]) rows[1] = [];
-    rows[1][colIndex] = status;
+    let resultCol = header.findIndex(h => String(h).trim().toLowerCase() === 'result' || String(h).trim().toLowerCase() === 'status');
+    if (resultCol === -1) { resultCol = header.length; header[resultCol] = 'Result'; rows[0] = header; }
+    const normalized = header.map(h => String(h).trim().toLowerCase().replace(/[\s_-]+/g, '_'));
+    const idColCandidates = ['accountid', 'patientid', 'account_id', 'patient_id'];
+    const idIndexes = normalized
+      .map((name, idx) => ({ name, idx }))
+      .filter(({ name }) => idColCandidates.includes(name))
+      .map(({ idx }) => idx);
+    let targetRow = -1;
+    if (currentRecordIdValue != null) {
+      const idStr = String(currentRecordIdValue).trim();
+      for (let i = 1; i < rows.length; i++) {
+        const row = rows[i] || [];
+        if (idIndexes.length) {
+          if (idIndexes.some(ci => String(row[ci] ?? '').trim() === idStr)) { targetRow = i; break; }
+        } else {
+          // Fallback: first column match
+          if (String(row[0] ?? '').trim() === idStr) { targetRow = i; break; }
+        }
+      }
+    }
+    if (targetRow === -1) { console.warn('Result write: matching row not found for Account/Patient ID'); return; }
+    while (rows.length <= targetRow) rows.push([]);
+    while (rows[targetRow].length <= resultCol) rows[targetRow].push('');
+    rows[targetRow][resultCol] = status;
     const newSheet = XLSX.utils.aoa_to_sheet(rows);
     workbook.Sheets[sheetName] = newSheet;
     XLSX.writeFile(workbook, filePath);
@@ -306,13 +328,14 @@ test.use({ headless: false });
 
 test.afterEach(async ({}, testInfo) => {
   const status = testInfo.status === 'passed' ? 'PASS' : 'FAIL';
-  writeTestResultToExcel(status);
+  writeResultForCurrentRecord(status);
 });
 
 test('visit emedpractice loads under VPN', async ({ page }) => {
   test.setTimeout(300000);
   const log = (msg) => console.log(`[visit] ${msg}`);
   const recordIdValue = getAccountOrPatientIdFromExcelOrEnv();
+  currentRecordIdValue = recordIdValue;
   const planCommunicationText = getPlanCommunicationFromExcelOrEnv();
   let providerText = '';
   const encounterTypeText = getEncounterTypeFromExcelOrEnv();
@@ -372,6 +395,26 @@ test('visit emedpractice loads under VPN', async ({ page }) => {
   }
   await page.waitForTimeout(2000);
 }
+await page.waitForTimeout(3000);
+// Check Filed column (td[9]) — if 'No', skip remaining flow for this row
+// {
+//   try {
+//     let filedCell = content.locator('xpath=//*[@id="_ctl0_ContentPlaceHolder1_gvAppointments"]/tbody/tr[1]/td[9]').first();
+//     if (!(await filedCell.count().catch(() => 0))) {
+//       filedCell = content.locator('xpath=//table[contains(@id, "gvAppointments")]/tbody/tr[1]/td[9]').first();
+//     }
+//     await filedCell.waitFor({ state: 'visible', timeout: 15000 });
+//     const filedText = (await filedCell.textContent()).trim().toLowerCase();
+//     log(`Filed column value: ${filedText}`);
+//     if (filedText === 'no') {
+//       log('Filed is No — skipping encounter flow for this row.');
+//       writeResultForCurrentRecord('SKIPPED: Filed=No');
+//       return; // Early exit; batch runner will proceed to next row
+//     }
+//   } catch (e) {
+//     log(`Failed to read Filed column: ${e.message}`);
+//   }
+// }
 // After opening Appointments, read the Appointment Type from the first data row (td[7] is "Office Visit")
 {
   try {
@@ -412,6 +455,7 @@ test('visit emedpractice loads under VPN', async ({ page }) => {
     log(`Failed to read Appointment Date: ${e.message}`);
   }
 }
+
 // Read Physician/Scheduler Name from the first data row (td[3]) to use as provider
 {
   try {
@@ -431,7 +475,6 @@ test('visit emedpractice loads under VPN', async ({ page }) => {
     log(`Failed to read Provider from grid: ${e.message}`);
   }
 }
-// Wait until Appointments tab is visible, then click (prefer parent anchor), frame-aware
 
 // Click ClinicalSummary link inside contentframe using role locator
 {
@@ -538,7 +581,7 @@ await page.waitForTimeout(5000);
           else throw new Error(`Provider option not found for: ${providerText}`);
         }
         // After selecting provider, wait and fill the date field
-        await page.waitForTimeout(5000);
+        await page.waitForTimeout(1000);
         try {
           const dateInput = frame.locator('#txtDate').first();
           await dateInput.waitFor({ state: 'visible', timeout: 10000 });
@@ -649,6 +692,33 @@ await page.waitForTimeout(5000);
   }
   
   await page.waitForTimeout(1000);
+}
+
+// Fill Notes textarea if present before inserting
+{
+  log('Filling notes textarea if available...');
+  let filledNotes = false;
+  try {
+    const frames = page.frames();
+    for (const frame of frames) {
+      try {
+        const notes = frame.locator('#txtNotes').first();
+        if (await notes.count()) {
+          await notes.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+          await notes.fill('QHS').catch(() => {});
+          filledNotes = true;
+          break;
+        }
+      } catch {}
+    }
+  } catch {}
+  if (!filledNotes) {
+    const notesTop = page.locator('#txtNotes').first();
+    if (await notesTop.count()) {
+      await notesTop.waitFor({ state: 'visible', timeout: 3000 }).catch(() => {});
+      await notesTop.fill('QHS').catch(() => {});
+    }
+  }
 }
 // Look for Insert button in all frames
 {
@@ -1148,4 +1218,243 @@ for (const f of page.frames()) {
 if (!closed) throw new Error('Plan Close button not found/clickable');
 await page.waitForTimeout(3000);
 }
+
+// After closing Plan, wait 3s and click the Demos tab (Patient Demographic Details)
+await page.waitForTimeout(3000);
+{
+  const demosSelectors = [
+    'li[title="Patient Demographic Details"]',
+    'xpath=//li[@title="Patient Demographic Details" or contains(@onclick, "showPatientDemos")]//a',
+    'xpath=//img[contains(@src, "demos.png")]/ancestor::li[1]'
+  ];
+  let demosClicked = false;
+  // Try top-level first
+  for (const sel of demosSelectors) {
+    const loc = page.locator(sel).first();
+    if (!(await loc.count().catch(() => 0))) continue;
+    await loc.scrollIntoViewIfNeeded().catch(() => {});
+    try { await loc.click({ timeout: 3000 }); demosClicked = true; break; } catch {}
+    try { await loc.click({ timeout: 3000, force: true }); demosClicked = true; break; } catch {}
+  }
+  // Fallback: search in frames
+  if (!demosClicked) {
+    for (const f of page.frames()) {
+      for (const sel of demosSelectors) {
+        const loc = f.locator(sel).first();
+        if (!(await loc.count().catch(() => 0))) continue;
+        await loc.scrollIntoViewIfNeeded().catch(() => {});
+        try { await loc.click({ timeout: 3000 }); demosClicked = true; break; } catch {}
+        try { await loc.click({ timeout: 3000, force: true }); demosClicked = true; break; } catch {}
+      }
+      if (demosClicked) break;
+    }
+  }
+}
+
+// After Demos, click Bills tab
+await page.waitForTimeout(3000);
+{
+  const billsXPath = '//*[contains(@class, "ui-tab-Txt")][normalize-space(.)="Bills"]';
+  let billsClicked = false;
+  // Try top-level first
+  {
+    const txt = page.locator(`xpath=${billsXPath}`).first();
+    const count = await txt.count().catch(() => 0);
+    if (count) {
+      const anchor = txt.locator('xpath=ancestor::a[1]').first();
+      try { if (await anchor.isVisible().catch(() => false)) { await anchor.click({ timeout: 3000 }); billsClicked = true; } } catch {}
+      if (!billsClicked) {
+        try { await txt.click({ timeout: 3000 }); billsClicked = true; } catch {}
+        if (!billsClicked) { try { await txt.click({ timeout: 3000, force: true }); billsClicked = true; } catch {} }
+      }
+    }
+  }
+  // Fallback: search in frames
+  if (!billsClicked) {
+    for (const f of page.frames()) {
+      const txt = f.locator(`xpath=${billsXPath}`).first();
+      const count = await txt.count().catch(() => 0);
+      if (!count) continue;
+      const anchor = txt.locator('xpath=ancestor::a[1]').first();
+      try { if (await anchor.isVisible().catch(() => false)) { await anchor.click({ timeout: 3000 }); billsClicked = true; } } catch {}
+      if (!billsClicked) {
+        try { await txt.click({ timeout: 3000 }); billsClicked = true; } catch {}
+        if (!billsClicked) { try { await txt.click({ timeout: 3000, force: true }); billsClicked = true; } catch {} }
+      }
+      if (billsClicked) break;
+    }
+  }
+}
+
+// Click Create Bill button
+await page.waitForTimeout(2000);
+{
+  const createSel = '#btn_CreateBill';
+  let clickedCreate = false;
+  // Try top-level first
+  {
+    const b = page.locator(createSel).first();
+    if (await b.count().catch(() => 0)) {
+      await b.scrollIntoViewIfNeeded().catch(() => {});
+      try { await b.click({ timeout: 3000 }); clickedCreate = true; } catch {}
+      if (!clickedCreate) { try { await b.click({ timeout: 3000, force: true }); clickedCreate = true; } catch {} }
+    }
+  }
+  // Fallback: search frames
+  if (!clickedCreate) {
+    for (const f of page.frames()) {
+      const b = f.locator(createSel).first();
+      if (!(await b.count().catch(() => 0))) continue;
+      await b.scrollIntoViewIfNeeded().catch(() => {});
+      try { await b.click({ timeout: 3000 }); clickedCreate = true; break; } catch {}
+      try { await b.click({ timeout: 3000, force: true }); clickedCreate = true; break; } catch {}
+    }
+  }
+}
+await page.waitForTimeout(3000);
+
+// Wait for the UI to load and fill the service date field
+{
+  try {
+    // Wait for any date input fields to appear
+    await page.waitForTimeout(2000);
+    
+    if (appointmentDateText) {
+      // Try multiple selectors for service FROM date
+      let serviceFromFilled = false;
+      const fromSelectors = [
+        'input[name="_ctl0:ContentPlaceHolder1:gvAddedCodes:_ctl2:txtService_From"]',
+        'input[id="_ctl0_ContentPlaceHolder1_gvAddedCodes__ctl2_txtService_From"]',
+        'input[id*="txtService_From"]',
+        'input[name*="txtService_From"]',
+        '.fromdate',
+        '.textbox.fromdate'
+      ];
+      
+      for (const selector of fromSelectors) {
+        try {
+          const element = page.locator(selector).first();
+          if (await element.count() > 0) {
+            await element.waitFor({ state: 'visible', timeout: 3000 });
+            // Scroll to the element if needed
+            await element.scrollIntoViewIfNeeded();
+            await page.waitForTimeout(500); // Wait for scroll to complete
+            await element.fill(appointmentDateText);
+            log(`Filled service FROM date with selector "${selector}": ${appointmentDateText}`);
+            serviceFromFilled = true;
+            break;
+          }
+        } catch (e) {
+          continue;
+        }
+      }
+      
+      // Try multiple selectors for service TO date
+      let serviceToFilled = false;
+      const toSelectors = [
+        'input[name="_ctl0:ContentPlaceHolder1:gvAddedCodes:_ctl2:txtService_To"]',
+        'input[id*="txtService_To"]',
+        'input[name*="txtService_To"]'
+      ];
+      
+      for (const selector of toSelectors) {
+        try {
+          const element = page.locator(selector).first();
+          if (await element.count() > 0) {
+            await element.waitFor({ state: 'visible', timeout: 3000 });
+            // Scroll to the element if needed
+            await element.scrollIntoViewIfNeeded();
+            await page.waitForTimeout(500); // Wait for scroll to complete
+            await element.fill(appointmentDateText);
+            log(`Filled service TO date with selector "${selector}": ${appointmentDateText}`);
+            serviceToFilled = true;
+            break;
+          }
+        } catch (e) {
+          continue;
+        }
+      }
+      
+      if (!serviceFromFilled && !serviceToFilled) {
+        log('Could not find any service date fields to fill');
+      }
+    } else {
+      log('No appointment date was captured earlier, skipping date fill');
+    }
+    
+    // Wait a moment for the field to be updated
+    await page.waitForTimeout(1000);
+    
+  } catch (error) {
+    log(`Failed to fill service date field: ${error.message}`);
+  }
+}
+
+// Click Save button after filling the dates
+{
+  let saveClicked = false;
+  const saveSelectors = [
+    'input[name="_ctl0:ContentPlaceHolder1:btnSave"]',
+    'input[id*="btnSave"]',
+    'input[value="Save"]',
+    '#_ctl0_ContentPlaceHolder1_btnSave'
+  ];
+  
+  for (const selector of saveSelectors) {
+    try {
+      const element = page.locator(selector).first();
+      if (await element.count() > 0) {
+        await element.waitFor({ state: 'visible', timeout: 5000 });
+        await element.scrollIntoViewIfNeeded();
+        await element.click();
+        log(`Clicked Save button with selector "${selector}"`);
+        saveClicked = true;
+        break;
+      }
+    } catch (e) {
+      continue;
+    }
+  }
+  
+  if (!saveClicked) {
+    log('Could not find Save button to click');
+  } else {
+    await page.waitForTimeout(2000);
+  }
+}
+
+// Click Claim button after saving
+{
+  let claimClicked = false;
+  const claimSelectors = [
+    'input[name="_ctl0:ContentPlaceHolder1:btnClaim"]',
+    'input[id*="btnClaim"]',
+    'input[value="Claim"]',
+    '#_ctl0_ContentPlaceHolder1_btnClaim'
+  ];
+  
+  for (const selector of claimSelectors) {
+    try {
+      const element = page.locator(selector).first();
+      if (await element.count() > 0) {
+        await element.waitFor({ state: 'visible', timeout: 5000 });
+        await element.scrollIntoViewIfNeeded();
+        await element.click();
+        log(`Clicked Claim button with selector "${selector}"`);
+        claimClicked = true;
+        break;
+      }
+    } catch (e) {
+      continue;
+    }
+  }
+  
+  if (!claimClicked) {
+    log('Could not find Claim button to click');
+  } else {
+    await page.waitForTimeout(3000);
+  }
+}
+
+
 });
