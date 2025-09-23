@@ -215,7 +215,24 @@ function getEncounterDateFromExcelOrEnv() {
     });
     if (!key) throw new Error('Date column not found');
     const match = rows.find(r => String(r[key]).trim() !== '');
-    if (match) return String(match[key]).trim();
+    if (match) {
+      const rawValue = match[key];
+      
+      // Check if it's an Excel serial number (like 45872)
+      if (typeof rawValue === 'number' || (!isNaN(rawValue) && String(rawValue).match(/^\d+$/))) {
+        // Convert Excel serial number to date
+        const excelDate = new Date((rawValue - 25569) * 86400 * 1000);
+        const month = String(excelDate.getMonth() + 1).padStart(2, '0');
+        const day = String(excelDate.getDate()).padStart(2, '0');
+        const year = excelDate.getFullYear();
+        const formattedDate = `${month}-${day}-${year}`;
+        console.log(`Converted Excel serial ${rawValue} to date: ${formattedDate}`);
+        return formattedDate;
+      } else {
+        // It's already a formatted date string
+        return String(rawValue).trim();
+      }
+    }
     throw new Error('Date column is present but has no values');
   } catch (e) {
     throw new Error(`Failed to read Encounter Date from Excel: ${e.message}`);
@@ -264,13 +281,72 @@ function formatEncounterDateForInput(raw) {
   return `${m}/${d}/${y}`; // Site expects MM/DD/YYYY
 }
 
+function formatAppointmentDateForXPath(dateString) {
+  if (!dateString) return '';
+  
+  log(`Converting appointmentDateText for XPath from: "${dateString}"`);
+  
+  // Remove any extra whitespace
+  let cleanDate = dateString.trim();
+  
+  // Handle different possible formats and convert to MM/DD/YYYY format for XPath matching
+  
+  // If already in MM/DD/YYYY format
+  if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(cleanDate)) {
+    log(`Date already in MM/DD/YYYY format: ${cleanDate}`);
+    return cleanDate;
+  }
+  
+  // If in MM-DD-YYYY format, convert to MM/DD/YYYY
+  if (/^\d{1,2}-\d{1,2}-\d{4}$/.test(cleanDate)) {
+    const converted = cleanDate.replace(/-/g, '/');
+    log(`Converted MM-DD-YYYY to MM/DD/YYYY: ${cleanDate} -> ${converted}`);
+    return converted;
+  }
+  
+  // If in YYYY-MM-DD format, convert to MM/DD/YYYY
+  if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(cleanDate)) {
+    const parts = cleanDate.split('-');
+    const month = parts[1].padStart(2, '0');
+    const day = parts[2].padStart(2, '0');
+    const year = parts[0];
+    const converted = `${month}/${day}/${year}`;
+    log(`Converted YYYY-MM-DD to MM/DD/YYYY: ${cleanDate} -> ${converted}`);
+    return converted;
+  }
+  
+  // Try to use the existing formatEncounterDateForInput function
+  try {
+    const converted = formatEncounterDateForInput(cleanDate);
+    log(`Used formatEncounterDateForInput: ${cleanDate} -> ${converted}`);
+    return converted;
+  } catch (e) {
+    log(`formatEncounterDateForInput failed: ${e.message}`);
+  }
+  
+  // If all else fails, return the original string
+  log(`Could not convert date format, returning original: ${cleanDate}`);
+  return cleanDate;
+}
+
 function buildFlexibleProviderRegex(name) {
   const raw = String(name || '').trim();
   if (!raw) return /.+/;
+  
+  // Handle common provider text variations
+  let normalized = raw;
+  // Convert "M.D" to "MD" for matching
+  normalized = normalized.replace(/\bM\.D\b/gi, 'MD');
+  // Allow both "APRN" and ", APRN" formats
+  normalized = normalized.replace(/\bAPRN\b/gi, '(?:,?\\s*APRN)');
+  // Allow both "MD" and "M.D" formats  
+  normalized = normalized.replace(/\bMD\b/gi, '(?:MD|M\\.D)');
+  
   // Escape regex specials
-  const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   // Allow commas or spaces between tokens (e.g., "JOEL MOLINA APRN" vs "JOEL MOLINA, APRN")
   const pattern = escaped.replace(/\s+/g, '[\\s,]*');
+
   return new RegExp(pattern, 'i');
 }
 
@@ -396,87 +472,165 @@ test('visit emedpractice loads under VPN', async ({ page }) => {
   await page.waitForTimeout(2000);
 }
 await page.waitForTimeout(3000);
-// Check Filed column (td[9]) — if 'No', skip remaining flow for this row
+// Find matching appointment row by ENCOUNTER_DATE from Excel and check Filed status
+{
+  try {
+    const encounterDateFromExcel = getEncounterDateFromExcelOrEnv();
+    log(`Looking for appointment row with date: ${encounterDateFromExcel}`);
+    
+    // Get all appointment rows
+    const appointmentRows = content.locator('xpath=//table[contains(@id, "gvAppointments")]/tbody/tr');
+    const rowCount = await appointmentRows.count();
+    log(`Found ${rowCount} appointment rows`);
+    
+    let matchingRowFound = false;
+    let matchingRowIndex = -1;
+    
+    // Search for row with matching date
+    for (let i = 1; i < rowCount; i++) { // Start from 1 to skip header
+      try {
+        const dateCell = appointmentRows.nth(i).locator('td').nth(3); // td[4] is date column (0-indexed)
+        const rowDate = (await dateCell.textContent()).trim();
+        
+        log(`Row ${i} date: ${rowDate}`);
+        
+        // Check if dates match (flexible matching)
+        if (rowDate.includes(encounterDateFromExcel) || encounterDateFromExcel.includes(rowDate)) {
+          log(`Found matching row ${i} with date: ${rowDate}`);
+          matchingRowIndex = i;
+          matchingRowFound = true;
+          
+          // Capture data from matching row
+          try {
+            // Appointment Date (td[4])
+            const dateCell = appointmentRows.nth(i).locator('td').nth(3);
+            appointmentDateText = (await dateCell.textContent()).trim();
+            log(`Captured appointmentDateText: ${appointmentDateText}`);
+            
+            // Provider (td[3])
+            const providerCell = appointmentRows.nth(i).locator('td').nth(2);
+            providerText = (await providerCell.textContent()).trim();
+            log(`Captured providerText: ${providerText}`);
+            
+            // Appointment Type (td[7])
+            const typeCell = appointmentRows.nth(i).locator('td').nth(6);
+            appointmentTypeText = (await typeCell.textContent()).trim();
+            log(`Captured appointmentTypeText: ${appointmentTypeText}`);
+            
+          } catch (e) {
+            log(`Failed to capture data from matching row: ${e.message}`);
+          }
+          
+          break;
+    }
+  } catch (e) {
+        log(`Error checking row ${i}: ${e.message}`);
+        continue;
+      }
+    }
+    
+    if (!matchingRowFound) {
+      log(`No appointment row found matching date: ${encounterDateFromExcel}`);
+      // Use first row as fallback
+      matchingRowIndex = 1;
+      log('Using first appointment row as fallback');
+    }
+    
+    // Check Filed column (td[9]) for the matching/first row
+    const filedCell = appointmentRows.nth(matchingRowIndex).locator('td').nth(8); // td[9] is 0-indexed as td[8]
+    await filedCell.waitFor({ state: 'visible', timeout: 15000 });
+    const filedText = (await filedCell.textContent()).trim().toLowerCase();
+    log(`Filed column value for row ${matchingRowIndex}: ${filedText}`);
+    
+    if (filedText === 'no') {
+      log('Filed is No — skipping encounter flow for this row.');
+      writeResultForCurrentRecord('SKIPPED: Filed=No');
+      return; // Early exit; batch runner will proceed to next row
+    }
+    
+  } catch (e) {
+    log(`Failed to process appointment rows by date: ${e.message}`);
+    // Fallback to original logic
+    try {
+      let filedCell = content.locator('xpath=//*[@id="_ctl0_ContentPlaceHolder1_gvAppointments"]/tbody/tr[1]/td[9]').first();
+      if (!(await filedCell.count().catch(() => 0))) {
+        filedCell = content.locator('xpath=//table[contains(@id, "gvAppointments")]/tbody/tr[1]/td[9]').first();
+      }
+      await filedCell.waitFor({ state: 'visible', timeout: 15000 });
+      const filedText = (await filedCell.textContent()).trim().toLowerCase();
+      log(`Filed column value (fallback): ${filedText}`);
+      if (filedText === 'no') {
+        log('Filed is No — skipping encounter flow for this row.');
+        writeResultForCurrentRecord('SKIPPED: Filed=No');
+        return;
+      }
+    } catch (fallbackError) {
+      log(`Fallback Filed check also failed: ${fallbackError.message}`);
+    }
+  }
+}
+// After opening Appointments, read the Appointment Type from the first data row (td[7] is "Office Visit")
 // {
 //   try {
-//     let filedCell = content.locator('xpath=//*[@id="_ctl0_ContentPlaceHolder1_gvAppointments"]/tbody/tr[1]/td[9]').first();
-//     if (!(await filedCell.count().catch(() => 0))) {
-//       filedCell = content.locator('xpath=//table[contains(@id, "gvAppointments")]/tbody/tr[1]/td[9]').first();
+//     // Prefer exact grid id; target first tbody row, 7th cell
+//     let cell = content.locator('xpath=//*[@id="_ctl0_ContentPlaceHolder1_gvAppointments"]/tbody/tr[1]/td[7]').first();
+//     if (!(await cell.count().catch(() => 0))) {
+//       // Fallback: any grid whose id contains gvAppointments
+//       cell = content.locator('xpath=//table[contains(@id, "gvAppointments")]/tbody/tr[1]/td[7]').first();
 //     }
-//     await filedCell.waitFor({ state: 'visible', timeout: 15000 });
-//     const filedText = (await filedCell.textContent()).trim().toLowerCase();
-//     log(`Filed column value: ${filedText}`);
-//     if (filedText === 'no') {
-//       log('Filed is No — skipping encounter flow for this row.');
-//       writeResultForCurrentRecord('SKIPPED: Filed=No');
-//       return; // Early exit; batch runner will proceed to next row
+//     await cell.waitFor({ state: 'visible', timeout: 15000 });
+//     const text = (await cell.textContent()).trim();
+//     if (text) {
+//       appointmentTypeText = text;
+//       log(`Appointment Type detected: ${appointmentTypeText}`);
+//     } else {
+//       log('Appointment Type cell was empty');
 //     }
 //   } catch (e) {
-//     log(`Failed to read Filed column: ${e.message}`);
+//     log(`Failed to read Appointment Type: ${e.message}`);
 //   }
 // }
-// After opening Appointments, read the Appointment Type from the first data row (td[7] is "Office Visit")
-{
-  try {
-    // Prefer exact grid id; target first tbody row, 7th cell
-    let cell = content.locator('xpath=//*[@id="_ctl0_ContentPlaceHolder1_gvAppointments"]/tbody/tr[1]/td[7]').first();
-    if (!(await cell.count().catch(() => 0))) {
-      // Fallback: any grid whose id contains gvAppointments
-      cell = content.locator('xpath=//table[contains(@id, "gvAppointments")]/tbody/tr[1]/td[7]').first();
-    }
-    await cell.waitFor({ state: 'visible', timeout: 15000 });
-    const text = (await cell.textContent()).trim();
-    if (text) {
-      appointmentTypeText = text;
-      log(`Appointment Type detected: ${appointmentTypeText}`);
-    } else {
-      log('Appointment Type cell was empty');
-    }
-  } catch (e) {
-    log(`Failed to read Appointment Type: ${e.message}`);
-  }
-}
-// Also read Appointment Date from the first data row (td[4])
-{
-  try {
-    let dateCell = content.locator('xpath=//*[@id="_ctl0_ContentPlaceHolder1_gvAppointments"]/tbody/tr[1]/td[4]').first();
-    if (!(await dateCell.count().catch(() => 0))) {
-      dateCell = content.locator('xpath=//table[contains(@id, "gvAppointments")]/tbody/tr[1]/td[4]').first();
-    }
-    await dateCell.waitFor({ state: 'visible', timeout: 15000 });
-    const raw = (await dateCell.textContent()).trim();
-    if (raw) {
-      appointmentDateText = raw;
-      log(`Appointment Date detected: ${appointmentDateText}`);
-    } else {
-      log('Appointment Date cell was empty');
-    }
-  } catch (e) {
-    log(`Failed to read Appointment Date: ${e.message}`);
-  }
-}
+// // Also read Appointment Date from the first data row (td[4])
+// {
+//   try {
+//     let dateCell = content.locator('xpath=//*[@id="_ctl0_ContentPlaceHolder1_gvAppointments"]/tbody/tr[1]/td[4]').first();
+//     if (!(await dateCell.count().catch(() => 0))) {
+//       dateCell = content.locator('xpath=//table[contains(@id, "gvAppointments")]/tbody/tr[1]/td[4]').first();
+//     }
+//     await dateCell.waitFor({ state: 'visible', timeout: 15000 });
+//     const raw = (await dateCell.textContent()).trim();
+//     if (raw) {
+//       appointmentDateText = raw;
+//       log(`Appointment Date detected: ${appointmentDateText}`);
+//     } else {
+//       log('Appointment Date cell was empty');
+//     }
+//   } catch (e) {
+//     log(`Failed to read Appointment Date: ${e.message}`);
+//   }
+// }
 
-// Read Physician/Scheduler Name from the first data row (td[3]) to use as provider
-{
-  try {
-    let providerCell = content.locator('xpath=//*[@id="_ctl0_ContentPlaceHolder1_gvAppointments"]/tbody/tr[1]/td[3]').first();
-    if (!(await providerCell.count().catch(() => 0))) {
-      providerCell = content.locator('xpath=//table[contains(@id, "gvAppointments")]/tbody/tr[1]/td[3]').first();
-    }
-    await providerCell.waitFor({ state: 'visible', timeout: 15000 });
-    const text = (await providerCell.textContent()).trim();
-    if (text) {
-      providerText = text;
-      log(`Provider detected from grid: ${providerText}`);
-    } else {
-      log('Provider cell was empty');
-    }
-  } catch (e) {
-    log(`Failed to read Provider from grid: ${e.message}`);
-  }
-}
+// // Read Physician/Scheduler Name from the first data row (td[3]) to use as provider
+// {
+//   try {
+//     let providerCell = content.locator('xpath=//*[@id="_ctl0_ContentPlaceHolder1_gvAppointments"]/tbody/tr[1]/td[3]').first();
+//     if (!(await providerCell.count().catch(() => 0))) {
+//       providerCell = content.locator('xpath=//table[contains(@id, "gvAppointments")]/tbody/tr[1]/td[3]').first();
+//     }
+//     await providerCell.waitFor({ state: 'visible', timeout: 15000 });
+//     const text = (await providerCell.textContent()).trim();
+//     if (text) {
+//       providerText = text;
+//       log(`Provider detected from grid: ${providerText}`);
+//     } else {
+//       log('Provider cell was empty');
+//     }
+//   } catch (e) {
+//     log(`Failed to read Provider from grid: ${e.message}`);
+//   }
+// }
 
-// Click ClinicalSummary link inside contentframe using role locator
+// // Click ClinicalSummary link inside contentframe using role locator
 {
   const link = content.getByRole('link', { name: 'ClinicalSummary' }).first();
   await link.waitFor({ state: 'visible', timeout: 60000 });
@@ -573,11 +727,13 @@ await page.waitForTimeout(5000);
           }
         }
         if (!clickedProvider) {
-          // Fallback: try exact contains with and without comma
+          // Fallback: try exact contains with and without comma, plus ARIEL RAMIREZ NAVARRO conversion
           const alt1 = frame.locator('.chosen-results li', { hasText: providerText }).first();
           const alt2 = frame.locator('.chosen-results li', { hasText: providerText.replace(/\s+APRN/i, ', APRN') }).first();
+          const alt3 = frame.locator('.chosen-results li', { hasText: providerText.replace(/ARIEL RAMIREZ NAVARRO M\.D/i, 'ARIEL RAMIREZ NAVARRO MD') }).first();
           if (await alt1.count()) { await alt1.click().catch(() => {}); }
           else if (await alt2.count()) { await alt2.click().catch(() => {}); }
+          else if (await alt3.count()) { await alt3.click().catch(() => {}); }
           else throw new Error(`Provider option not found for: ${providerText}`);
         }
         // After selecting provider, wait and fill the date field
@@ -790,10 +946,18 @@ await page.waitForTimeout(5000);
   await frame?.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
   await frame?.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
 
+  // Convert appointmentDateText from MM-DD-YYYY to MM/DD/YYYY format for XPath
+  const formattedDateForXPath = appointmentDateText.replace(/-/g, '/');
+  log(`Converting date for fallback XPath: ${appointmentDateText} -> ${formattedDateForXPath}`);
+
   const xpaths = [
-    '//a[normalize-space(.)="Work on this"]',
-    '//a[contains(normalize-space(.), "Work on this")]',
-    '//*[@role="link" and contains(normalize-space(.), "Work on this")]'
+    // First try the specific XPath with the formatted date
+    `//table[@id="tblEncounter"]//tr[td[3]/a[contains(text(), "${formattedDateForXPath}")]]//a[contains(text(), "Work on this")]`,
+    
+    // Then try generic "Work on this" buttons as fallback
+    // '//a[normalize-space(.)="Work on this"]',
+    // '//a[contains(normalize-space(.), "Work on this")]',
+    // '//*[@role="link" and contains(normalize-space(.), "Work on this")]'
   ];
 
   let clicked = false;
@@ -812,7 +976,7 @@ await page.waitForTimeout(5000);
   if (!clicked) {
     for (const f of page.frames()) {
       try {
-        const loc = f.locator('xpath=//a[contains(normalize-space(.), "Work on this")]').first();
+        const loc = f.locator(`xpath=//table[@id="tblEncounter"]//tr[td[3]/a[contains(text(), "${formattedDateForXPath}")]]//a[contains(text(), "Work on this")]`);
         if (await loc.count() > 0) {
           await loc.scrollIntoViewIfNeeded().catch(() => {});
           await loc.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
@@ -1083,74 +1247,118 @@ for (const f of page.frames()) {
 if (!completeClicked) throw new Error('Complete Plan not found/clickable');
 await page.waitForTimeout(5000);
 // Select radio: rbtnRenderType_1 (value P)
-// const radioSelectors = [
-//   '#rbtnRenderType_1',
-//   'input[type="radio"][name="rbtnRenderType"][value="P"]'
-// ];
+const radioSelectors = [
+  '#rbtnRenderType_1',
+  'input[type="radio"][name="rbtnRenderType"][value="P"]'
+];
 
-// let checked = false;
+let checked = false;
 
-// // Try in top page first
-// for (const sel of radioSelectors) {
-//   const r = page.locator(sel).first();
-//   if (await r.count()) {
-//     await r.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
-//     try { await r.check({ timeout: 3000 }); checked = true; break; } catch {}
-//     try { await r.click({ timeout: 3000, force: true }); checked = true; break; } catch {}
-//   }
-// }
+// First check if radio button is already selected
+log('Checking if radio button is already selected...');
 
-// // Fallback: search in iframes
-// if (!checked) {
-//   for (const f of page.frames()) {
-//     for (const sel of radioSelectors) {
-//       const r = f.locator(sel).first();
-//       if (!(await r.count())) continue;
-//       await r.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
-//       try { await r.check({ timeout: 3000 }); checked = true; break; } catch {}
-//       try { await r.click({ timeout: 3000, force: true }); checked = true; break; } catch {}
-//     }
-//     if (checked) break;
-//   }
-// }
+// Check in top page first
+for (const sel of radioSelectors) {
+  const r = page.locator(sel).first();
+  if (await r.count()) {
+    const isAlreadyChecked = await r.isChecked().catch(() => false);
+    if (isAlreadyChecked) {
+      log(`Radio button ${sel} is already checked - skipping selection`);
+      checked = true;
+      break;
+    }
+  }
+}
 
-// if (!checked) throw new Error('Radio rbtnRenderType_1 not found/clickable');
-// await page.waitForTimeout(3000);
-// // Click OK button (id=btnParagraphOk)
-// const okSelectors = [
-//   '#btnParagraphOk',
-//   'input[type="button"][id="btnParagraphOk"][value="OK"]'
-// ];
+// Check in iframes if not found/checked in top page
+if (!checked) {
+  for (const f of page.frames()) {
+    for (const sel of radioSelectors) {
+      const r = f.locator(sel).first();
+      if (!(await r.count())) continue;
+      const isAlreadyChecked = await r.isChecked().catch(() => false);
+      if (isAlreadyChecked) {
+        log(`Radio button ${sel} is already checked in iframe - skipping selection`);
+        checked = true;
+        break;
+      }
+    }
+    if (checked) break;
+  }
+}
 
-// // try top-level first
-// let okClicked = false;
-// for (const sel of okSelectors) {
-//   const ok = page.locator(sel).first();
-//   if (await ok.count()) {
-//     await ok.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
-//     await ok.scrollIntoViewIfNeeded().catch(() => {});
-//     try { await ok.click({ timeout: 3000 }); okClicked = true; break; } catch {}
-//     try { await ok.click({ timeout: 3000, force: true }); okClicked = true; break; } catch {}
-//   }
-// }
+// Only proceed with selection and OK button if not already checked
+if (!checked) {
+  log('Radio button not checked - proceeding with selection...');
+  
+  // Try in top page first
+  for (const sel of radioSelectors) {
+    const r = page.locator(sel).first();
+    if (await r.count()) {
+      await r.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
+      try { await r.check({ timeout: 3000 }); checked = true; log(`Successfully checked radio ${sel}`); break; } catch {}
+      try { await r.click({ timeout: 3000, force: true }); checked = true; log(`Successfully clicked radio ${sel}`); break; } catch {}
+    }
+  }
 
-// // fallback: search frames
-// if (!okClicked) {
-//   for (const f of page.frames()) {
-//     for (const sel of okSelectors) {
-//       const ok = f.locator(sel).first();
-//       if (!(await ok.count())) continue;
-//       await ok.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
-//       await ok.scrollIntoViewIfNeeded().catch(() => {});
-//       try { await ok.click({ timeout: 3000 }); okClicked = true; break; } catch {}
-//       try { await ok.click({ timeout: 3000, force: true }); okClicked = true; break; } catch {}
-//     }
-//     if (okClicked) break;
-//   }
-// }
+  // Fallback: search in iframes
+  if (!checked) {
+    for (const f of page.frames()) {
+      for (const sel of radioSelectors) {
+        const r = f.locator(sel).first();
+        if (!(await r.count())) continue;
+        await r.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
+        try { await r.check({ timeout: 3000 }); checked = true; log(`Successfully checked radio ${sel} in iframe`); break; } catch {}
+        try { await r.click({ timeout: 3000, force: true }); checked = true; log(`Successfully clicked radio ${sel} in iframe`); break; } catch {}
+      }
+      if (checked) break;
+    }
+  }
+  
+  if (!checked) throw new Error('Radio rbtnRenderType_1 not found/clickable');
+  
+  await page.waitForTimeout(3000);
+  
+  // Click OK button (id=btnParagraphOk) - only if we just selected the radio button
+  log('Radio button was just selected - clicking OK button...');
+  const okSelectors = [
+    '#btnParagraphOk',
+    'input[type="button"][id="btnParagraphOk"][value="OK"]'
+  ];
 
-// if (!okClicked) throw new Error('OK button (btnParagraphOk) not found/clickable');
-// await page.waitForTimeout(5000);
+  // try top-level first
+  let okClicked = false;
+  for (const sel of okSelectors) {
+    const ok = page.locator(sel).first();
+    if (await ok.count()) {
+      await ok.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
+      await ok.scrollIntoViewIfNeeded().catch(() => {});
+      try { await ok.click({ timeout: 3000 }); okClicked = true; break; } catch {}
+      try { await ok.click({ timeout: 3000, force: true }); okClicked = true; break; } catch {}
+    }
+  }
+
+  // fallback: search frames
+  if (!okClicked) {
+    for (const f of page.frames()) {
+      for (const sel of okSelectors) {
+        const ok = f.locator(sel).first();
+        if (!(await ok.count())) continue;
+        await ok.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
+        await ok.scrollIntoViewIfNeeded().catch(() => {});
+        try { await ok.click({ timeout: 3000 }); okClicked = true; break; } catch {}
+        try { await ok.click({ timeout: 3000, force: true }); okClicked = true; break; } catch {}
+      }
+      if (okClicked) break;
+    }
+  }
+
+  if (!okClicked) throw new Error('OK button (btnParagraphOk) not found/clickable');
+  await page.waitForTimeout(5000);
+  
+} else {
+  log('Radio button was already checked - skipping radio selection and OK button, going directly to plan text filling');
+}
 // Fill Plan details (TinyMCE editor for txtCodePlanData)
 // Fill Plan details (TinyMCE editor for txtCodePlanData) - bounded, scroll-aware, frame-agnostic
 const PLAN_FIND_TIMEOUT_MS = 20000;
@@ -1311,7 +1519,7 @@ await page.waitForTimeout(2000);
     }
   }
 }
-await page.waitForTimeout(3000);
+await page.waitForTimeout(5000);
 
 // Wait for the UI to load and fill the service date field
 {
@@ -1320,7 +1528,7 @@ await page.waitForTimeout(3000);
     await page.waitForTimeout(2000);
     
     if (appointmentDateText) {
-      // Try multiple selectors for service FROM date
+      // Try multiple selectors for service FROM date with comprehensive iframe and scroll handling
       let serviceFromFilled = false;
       const fromSelectors = [
         'input[name="_ctl0:ContentPlaceHolder1:gvAddedCodes:_ctl2:txtService_From"]',
@@ -1328,9 +1536,11 @@ await page.waitForTimeout(3000);
         'input[id*="txtService_From"]',
         'input[name*="txtService_From"]',
         '.fromdate',
-        '.textbox.fromdate'
+        '.textbox.fromdate',
+        '.textbox.fromdate.ui-mask.hasDatepicker'
       ];
       
+      // First try in main page
       for (const selector of fromSelectors) {
         try {
           const element = page.locator(selector).first();
@@ -1340,23 +1550,109 @@ await page.waitForTimeout(3000);
             await element.scrollIntoViewIfNeeded();
             await page.waitForTimeout(500); // Wait for scroll to complete
             await element.fill(appointmentDateText);
-            log(`Filled service FROM date with selector "${selector}": ${appointmentDateText}`);
-            serviceFromFilled = true;
-            break;
+            
+            // Verify that the exact date was filled
+            await page.waitForTimeout(500); // Wait for value to be set
+            const filledValue = await element.inputValue();
+            if (filledValue === appointmentDateText) {
+              log(`Filled service FROM date with main page selector "${selector}": ${appointmentDateText} ✓ VERIFIED`);
+              console.log(`[DATE FILL] Service FROM field filled with date: ${appointmentDateText} ✓ VERIFIED`);
+              serviceFromFilled = true;
+              break;
+            } else {
+              log(`Date verification failed for selector "${selector}". Expected: ${appointmentDateText}, Got: ${filledValue}`);
+              continue; // Try next selector
+            }
           }
         } catch (e) {
           continue;
         }
       }
       
-      // Try multiple selectors for service TO date
+      // If not found in main page, try in contentframe iframe
+      if (!serviceFromFilled) {
+        try {
+          const content = page.frameLocator('iframe[name="contentframe"]');
+          for (const selector of fromSelectors) {
+            try {
+              const element = content.locator(selector).first();
+              if (await element.count() > 0) {
+                await element.waitFor({ state: 'visible', timeout: 3000 });
+                // Scroll to the element if needed
+                await element.scrollIntoViewIfNeeded();
+                await page.waitForTimeout(500); // Wait for scroll to complete
+                await element.fill(appointmentDateText);
+                
+                // Verify that the exact date was filled
+                await page.waitForTimeout(500); // Wait for value to be set
+                const filledValue = await element.inputValue();
+                if (filledValue === appointmentDateText) {
+                  log(`Filled service FROM date with iframe selector "${selector}": ${appointmentDateText} ✓ VERIFIED`);
+                  console.log(`[DATE FILL] Service FROM field filled with date: ${appointmentDateText} ✓ VERIFIED`);
+                  serviceFromFilled = true;
+                  break;
+                } else {
+                  log(`Date verification failed for iframe selector "${selector}". Expected: ${appointmentDateText}, Got: ${filledValue}`);
+                  continue; // Try next selector
+                }
+              }
+            } catch (e) {
+              continue;
+            }
+          }
+        } catch (e) {
+          log(`Failed to access contentframe for service FROM date: ${e.message}`);
+        }
+      }
+      
+      // If still not found, try all frames
+      if (!serviceFromFilled) {
+        const frames = page.frames();
+        for (const frame of frames) {
+          for (const selector of fromSelectors) {
+            try {
+              const element = frame.locator(selector).first();
+              if (await element.count() > 0) {
+                await element.waitFor({ state: 'visible', timeout: 3000 });
+                // Scroll to the element if needed
+                await element.scrollIntoViewIfNeeded();
+                await page.waitForTimeout(500); // Wait for scroll to complete
+                await element.fill(appointmentDateText);
+                
+                // Verify that the exact date was filled
+                await page.waitForTimeout(500); // Wait for value to be set
+                const filledValue = await element.inputValue();
+                if (filledValue === appointmentDateText) {
+                  log(`Filled service FROM date with frame selector "${selector}": ${appointmentDateText} ✓ VERIFIED`);
+                  console.log(`[DATE FILL] Service FROM field filled with date: ${appointmentDateText} ✓ VERIFIED`);
+                  serviceFromFilled = true;
+                  break;
+                } else {
+                  log(`Date verification failed for frame selector "${selector}". Expected: ${appointmentDateText}, Got: ${filledValue}`);
+                  continue; // Try next selector
+                }
+              }
+            } catch (e) {
+              continue;
+            }
+          }
+          if (serviceFromFilled) break;
+        }
+      }
+      
+      // Try multiple selectors for service TO date with comprehensive iframe and scroll handling
       let serviceToFilled = false;
       const toSelectors = [
         'input[name="_ctl0:ContentPlaceHolder1:gvAddedCodes:_ctl2:txtService_To"]',
+        'input[id="_ctl0_ContentPlaceHolder1_gvAddedCodes__ctl2_txtService_To"]',
         'input[id*="txtService_To"]',
-        'input[name*="txtService_To"]'
+        'input[name*="txtService_To"]',
+        '.todate',
+        '.textbox.todate',
+        '.textbox.todate.ui-mask.hasDatepicker'
       ];
       
+      // First try in main page
       for (const selector of toSelectors) {
         try {
           const element = page.locator(selector).first();
@@ -1366,12 +1662,93 @@ await page.waitForTimeout(3000);
             await element.scrollIntoViewIfNeeded();
             await page.waitForTimeout(500); // Wait for scroll to complete
             await element.fill(appointmentDateText);
-            log(`Filled service TO date with selector "${selector}": ${appointmentDateText}`);
-            serviceToFilled = true;
-            break;
+            
+            // Verify that the exact date was filled
+            await page.waitForTimeout(500); // Wait for value to be set
+            const filledValue = await element.inputValue();
+            if (filledValue === appointmentDateText) {
+              log(`Filled service TO date with main page selector "${selector}": ${appointmentDateText} ✓ VERIFIED`);
+              console.log(`[DATE FILL] Service TO field filled with date: ${appointmentDateText} ✓ VERIFIED`);
+              serviceToFilled = true;
+              break;
+            } else {
+              log(`Date verification failed for TO selector "${selector}". Expected: ${appointmentDateText}, Got: ${filledValue}`);
+              continue; // Try next selector
+            }
           }
         } catch (e) {
           continue;
+        }
+      }
+      
+      // If not found in main page, try in contentframe iframe
+      if (!serviceToFilled) {
+        try {
+          const content = page.frameLocator('iframe[name="contentframe"]');
+          for (const selector of toSelectors) {
+            try {
+              const element = content.locator(selector).first();
+              if (await element.count() > 0) {
+                await element.waitFor({ state: 'visible', timeout: 3000 });
+                // Scroll to the element if needed
+                await element.scrollIntoViewIfNeeded();
+                await page.waitForTimeout(500); // Wait for scroll to complete
+                await element.fill(appointmentDateText);
+                
+                // Verify that the exact date was filled
+                await page.waitForTimeout(500); // Wait for value to be set
+                const filledValue = await element.inputValue();
+                if (filledValue === appointmentDateText) {
+                  log(`Filled service TO date with iframe selector "${selector}": ${appointmentDateText} ✓ VERIFIED`);
+                  console.log(`[DATE FILL] Service TO field filled with date: ${appointmentDateText} ✓ VERIFIED`);
+                  serviceToFilled = true;
+                  break;
+                } else {
+                  log(`Date verification failed for TO iframe selector "${selector}". Expected: ${appointmentDateText}, Got: ${filledValue}`);
+                  continue; // Try next selector
+                }
+              }
+            } catch (e) {
+              continue;
+            }
+          }
+        } catch (e) {
+          log(`Failed to access contentframe for service TO date: ${e.message}`);
+        }
+      }
+      
+      // If still not found, try all frames
+      if (!serviceToFilled) {
+        const frames = page.frames();
+        for (const frame of frames) {
+          for (const selector of toSelectors) {
+            try {
+              const element = frame.locator(selector).first();
+              if (await element.count() > 0) {
+                await element.waitFor({ state: 'visible', timeout: 3000 });
+                // Scroll to the element if needed
+                await element.scrollIntoViewIfNeeded();
+                await page.waitForTimeout(500); // Wait for scroll to complete
+                await element.fill(appointmentDateText);
+                
+                // Verify that the exact date was filled
+                await page.waitForTimeout(500); // Wait for value to be set
+                const filledValue = await element.inputValue();
+                if (filledValue === appointmentDateText) {
+                  log(`Filled service TO date with frame selector "${selector}": ${appointmentDateText} ✓ VERIFIED`);
+                  console.log(`[DATE FILL] Service TO field filled with date: ${appointmentDateText} ✓ VERIFIED`);
+                  serviceToFilled = true;
+                  break;
+                } else {
+                  log(`Date verification failed for TO frame selector "${selector}". Expected: ${appointmentDateText}, Got: ${filledValue}`);
+                  continue; // Try next selector
+                }
+              }
+            } catch (e) {
+              continue;
+            }
+          }
+          if (serviceToFilled) break;
         }
       }
       
@@ -1390,40 +1767,587 @@ await page.waitForTimeout(3000);
   }
 }
 
-// Click Save button after filling the dates
+// Select provider from dropdown after filling dates
 {
-  let saveClicked = false;
-  const saveSelectors = [
-    'input[name="_ctl0:ContentPlaceHolder1:btnSave"]',
-    'input[id*="btnSave"]',
-    'input[value="Save"]',
-    '#_ctl0_ContentPlaceHolder1_btnSave'
-  ];
-  
-  for (const selector of saveSelectors) {
-    try {
-      const element = page.locator(selector).first();
-      if (await element.count() > 0) {
-        await element.waitFor({ state: 'visible', timeout: 5000 });
-        await element.scrollIntoViewIfNeeded();
-        await element.click();
-        log(`Clicked Save button with selector "${selector}"`);
-        saveClicked = true;
-        break;
+  try {
+    if (providerText && providerText.trim() !== '') {
+      log(`Selecting provider: ${providerText}`);
+      console.log(`[PROVIDER SELECT] Looking for: ${providerText}`);
+      
+      await page.waitForTimeout(2000);
+      let providerSelected = false;
+      const frames = page.frames();
+      
+      // First try to find the specific encounter provider dropdown - enhanced selectors
+      const encounterDropdownSelectors = [
+        // Exact ID from the HTML structure
+        '#_ctl0_ContentPlaceHolder1_ddlEncounterProvider_chosen',
+        
+        // Chosen container variations
+        '.chosen-container[id="_ctl0_ContentPlaceHolder1_ddlEncounterProvider_chosen"]',
+        '.chosen-container[id*="ddlEncounterProvider_chosen"]',
+        
+        // Chosen single trigger (the clickable part)
+        '#_ctl0_ContentPlaceHolder1_ddlEncounterProvider_chosen .chosen-single',
+        '#_ctl0_ContentPlaceHolder1_ddlEncounterProvider_chosen a.chosen-single',
+        
+        // Alternative approaches
+        'div[id="_ctl0_ContentPlaceHolder1_ddlEncounterProvider_chosen"]',
+        'div[id*="ddlEncounterProvider_chosen"] .chosen-single',
+        
+        // Fallback to the original select (though it's hidden)
+        'select[name="_ctl0:ContentPlaceHolder1:ddlEncounterProvider"]',
+        'select[id="_ctl0_ContentPlaceHolder1_ddlEncounterProvider"]'
+      ];
+      
+      for (const frame of frames) {
+        try {
+          log(`Checking frame for encounter provider dropdown: ${frame.url()}`);
+          
+          // Try specific encounter provider dropdown first
+          for (const selector of encounterDropdownSelectors) {
+            try {
+              const dropdown = frame.locator(selector).first();
+              if (await dropdown.count() > 0) {
+                const isVisible = await dropdown.isVisible().catch(() => false);
+                if (isVisible) {
+                  log(`Found encounter provider dropdown, clicking...`);
+                  await dropdown.scrollIntoViewIfNeeded().catch(() => {});
+                  await dropdown.click();
+                  await page.waitForTimeout(1000);
+                  
+                  // Look for provider options with flexible matching - specific to this dropdown
+                  const providerRegex = buildFlexibleProviderRegex(providerText);
+                  
+                  // Try multiple selectors for the options list
+                  const optionSelectors = [
+                    '#_ctl0_ContentPlaceHolder1_ddlEncounterProvider_chosen .chosen-results li.active-result',
+                    '.chosen-container[id*="ddlEncounterProvider_chosen"] .chosen-results li.active-result',
+                    '.chosen-results li.active-result'
+                  ];
+                  
+                  let options = null;
+                  let optionCount = 0;
+                  
+                  for (const optSelector of optionSelectors) {
+                    options = frame.locator(optSelector);
+                    optionCount = await options.count();
+                    if (optionCount > 0) {
+                      log(`Found ${optionCount} options using selector: ${optSelector}`);
+                      break;
+                    }
+                  }
+                  
+                  if (optionCount === 0) {
+                    log('No options found in dropdown, trying to click again...');
+                    await dropdown.click();
+                    await page.waitForTimeout(1000);
+                    
+                    // Try again after second click
+                    for (const optSelector of optionSelectors) {
+                      options = frame.locator(optSelector);
+                      optionCount = await options.count();
+                      if (optionCount > 0) {
+                        log(`Found ${optionCount} options after second click using: ${optSelector}`);
+                        break;
+                      }
+                    }
+                  }
+                  
+                  for (let j = 0; j < optionCount; j++) {
+                    const item = options.nth(j);
+                    const txt = (await item.textContent()).trim();
+                    
+                    // Skip the "--Select--" option
+                    if (txt === '--Select--') continue;
+                    
+                    if (providerRegex.test(txt)) {
+                      log(`Selecting provider match: ${txt}`);
+                      console.log(`[PROVIDER SELECT] Found and selecting: ${txt}`);
+                      await item.click();
+                      providerSelected = true;
+                      break;
+                    }
+                  }
+                  
+                  // Fallback: try exact text matching
+                  if (!providerSelected) {
+                    const exactOption = frame.locator('.chosen-results li.active-result', { hasText: providerText }).first();
+                    const arielOption = frame.locator('.chosen-results li.active-result', { hasText: providerText.replace(/ARIEL RAMIREZ NAVARRO M\.D/i, 'ARIEL RAMIREZ NAVARRO MD') }).first();
+                    
+                    if (await exactOption.count()) {
+                      await exactOption.click();
+                      log(`Selected provider with exact match: ${providerText}`);
+                      console.log(`[PROVIDER SELECT] Selected with exact match: ${providerText}`);
+                      providerSelected = true;
+                    } else if (await arielOption.count()) {
+                      await arielOption.click();
+                      log(`Selected ARIEL RAMIREZ NAVARRO with MD conversion`);
+                      console.log(`[PROVIDER SELECT] Selected ARIEL RAMIREZ NAVARRO with MD conversion`);
+                      providerSelected = true;
+                    }
+                  }
+                  
+                  if (providerSelected) break;
+                }
+              }
+            } catch (e) {
+              continue;
+            }
+          }
+          
+          // If specific dropdown not found, fallback to generic chosen containers
+          if (!providerSelected) {
+            const dropdowns = frame.locator('.chosen-container');
+            const count = await dropdowns.count();
+            
+            for (let i = 0; i < count; i++) {
+              const dropdown = dropdowns.nth(i);
+              const isVisible = await dropdown.isVisible().catch(() => false);
+              
+              if (isVisible) {
+                log(`Trying generic chosen dropdown ${i + 1}...`);
+                await dropdown.click();
+                await page.waitForTimeout(1000);
+                
+                const options = frame.locator('.chosen-results li.active-result');
+                await options.first().waitFor({ state: 'visible', timeout: 3000 }).catch(() => {});
+                const optionCount = await options.count();
+                
+                for (let j = 0; j < optionCount; j++) {
+                  const item = options.nth(j);
+                  const txt = (await item.textContent()).trim();
+                  
+                  if (txt === '--Select--') continue;
+                  
+                  if (buildFlexibleProviderRegex(providerText).test(txt)) {
+                    log(`Selecting provider from generic dropdown: ${txt}`);
+                    console.log(`[PROVIDER SELECT] Selected from generic dropdown: ${txt}`);
+                    await item.click();
+                    providerSelected = true;
+                    break;
+                  }
+                }
+                
+                if (providerSelected) break;
+              }
+            }
+          }
+          
+          if (providerSelected) break;
+        } catch (e) {
+          log(`Frame check failed: ${e.message}`);
+        }
       }
-    } catch (e) {
-      continue;
+      
+      if (!providerSelected) {
+        log(`Provider not selected: ${providerText}`);
+        console.log(`[PROVIDER SELECT] Failed to select: ${providerText}`);
+      }
+    } else {
+      log('No provider text available');
+      console.log(`[PROVIDER SELECT] No provider text captured`);
     }
-  }
-  
-  if (!saveClicked) {
-    log('Could not find Save button to click');
-  } else {
-    await page.waitForTimeout(2000);
+    
+  } catch (error) {
+    log(`Provider selection error: ${error.message}`);
+    console.log(`[PROVIDER SELECT] Error: ${error.message}`);
   }
 }
+await page.waitForTimeout(5000); // Increased wait time for form to be ready
 
-// Click Claim button after saving
+// Add CPT codes one by one in different rows: 96136, 96137, 99401
+{
+  const cptCodes = ['96136', '96137', '99401'];
+  
+  // Define selectors for each row - _ctl2, _ctl3, _ctl4 for rows 1, 2, 3
+  const cptRowSelectors = [
+    // Row 1 (_ctl2)
+    [
+      'input[name="_ctl0:ContentPlaceHolder1:gvAddedCodes:_ctl2:txtCPTCode"]',
+      'input[id="_ctl0_ContentPlaceHolder1_gvAddedCodes__ctl2_txtCPTCode"]',
+      'input[id*="_ctl2_txtCPTCode"]',
+      'input[name*="_ctl2:txtCPTCode"]'
+    ],
+    // Row 2 (_ctl3)
+    [
+      'input[name="_ctl0:ContentPlaceHolder1:gvAddedCodes:_ctl3:txtCPTCode"]',
+      'input[id="_ctl0_ContentPlaceHolder1_gvAddedCodes__ctl3_txtCPTCode"]',
+      'input[id*="_ctl3_txtCPTCode"]',
+      'input[name*="_ctl3:txtCPTCode"]'
+    ],
+    // Row 3 (_ctl4)
+    [
+      'input[name="_ctl0:ContentPlaceHolder1:gvAddedCodes:_ctl4:txtCPTCode"]',
+      'input[id="_ctl0_ContentPlaceHolder1_gvAddedCodes__ctl4_txtCPTCode"]',
+      'input[id*="_ctl4_txtCPTCode"]',
+      'input[name*="_ctl4:txtCPTCode"]'
+    ]
+  ];
+  
+  for (let i = 0; i < cptCodes.length; i++) {
+    const cptCode = cptCodes[i];
+    const rowSelectors = cptRowSelectors[i]; // Get selectors for this specific row
+    let cptFilled = false;
+    
+    log(`Adding CPT code ${i + 1}/3: ${cptCode} in row ${i + 1}`);
+    
+    // Try in main page first
+    for (const selector of rowSelectors) {
+      try {
+        const element = page.locator(selector).first();
+        if (await element.count() > 0) {
+          await element.waitFor({ state: 'visible', timeout: 5000 });
+          await element.scrollIntoViewIfNeeded();
+          await page.waitForTimeout(500);
+          
+          // Clear field and fill with CPT code
+          await element.clear();
+          await element.fill(cptCode);
+          await page.waitForTimeout(1000); // Wait for dropdown to appear
+          
+          // Look for and click on the dropdown option - target table row structure
+          const dropdownSelectors = [
+            // Target table rows containing CPT codes
+            'tr td div.width60',
+            'tr td .width60',
+            '.ui-autocomplete tr',
+            '.ui-autocomplete li.ui-menu-item',
+            '.ui-autocomplete .ui-menu-item',
+            '.ui-menu .ui-menu-item',
+            '.ui-autocomplete-menu li',
+            '.autocomplete-suggestions div',
+            '.autocomplete-suggestions tr'
+          ];
+          
+          let dropdownClicked = false;
+          for (const dropdownSelector of dropdownSelectors) {
+            try {
+              const dropdownOptions = page.locator(dropdownSelector);
+              const optionCount = await dropdownOptions.count();
+              
+              if (optionCount > 0) {
+                log(`Found ${optionCount} dropdown options for CPT ${cptCode}`);
+                
+                // Look for the option that contains our CPT code (skip header rows)
+                for (let j = 0; j < optionCount; j++) {
+                  const option = dropdownOptions.nth(j);
+                  const optionText = await option.textContent();
+                  
+                  if (optionText && optionText.includes(cptCode)) {
+                    // Check if this is a table row structure (div.width60 containing CPT)
+                    if (dropdownSelector.includes('width60') || dropdownSelector.includes('tr')) {
+                      // For table row structure, look for exact CPT match in the div
+                      const cptDiv = option.locator('div.width60, .width60').first();
+                      if (await cptDiv.count() > 0) {
+                        const cptDivText = await cptDiv.textContent();
+                        if (cptDivText && cptDivText.trim() === cptCode) {
+                          // Skip first occurrence (likely header), click on data row
+                          if (j === 0) {
+                            log(`Skipping first row (header) for CPT: ${cptCode}, looking for data row`);
+                            continue;
+                          }
+                          log(`Clicking table data row ${j} for CPT: ${cptCode}`);
+                          await option.scrollIntoViewIfNeeded().catch(() => {});
+                          await page.waitForTimeout(300);
+                          await option.click();
+                          dropdownClicked = true;
+                          break;
+                        }
+                      }
+                    } else {
+                      // For regular dropdown options, ensure CPT code is at the start
+                      if (optionText.trim().startsWith(cptCode)) {
+                        log(`Clicking dropdown option: ${optionText.trim()}`);
+                        await option.scrollIntoViewIfNeeded().catch(() => {});
+                        await page.waitForTimeout(300);
+                        await option.click();
+                        dropdownClicked = true;
+                        break;
+                      } else {
+                        log(`Skipping non-matching option: ${optionText.trim()}`);
+                      }
+                    }
+                  }
+                }
+                
+                if (dropdownClicked) break;
+              }
+            } catch (e) {
+              continue;
+            }
+          }
+          
+          if (!dropdownClicked) {
+            log(`No dropdown found or clicked for CPT ${cptCode}, continuing...`);
+          }
+          
+          // Wait after dropdown selection
+          await page.waitForTimeout(500);
+          
+          // Verify the CPT code was filled correctly
+          const filledValue = await element.inputValue();
+          if (filledValue === cptCode) {
+            log(`CPT code ${cptCode} filled with main page selector "${selector}" ✓ VERIFIED`);
+            console.log(`[CPT FILL] CPT code ${cptCode} filled successfully ✓ VERIFIED`);
+            cptFilled = true;
+            break;
+          } else {
+            log(`CPT verification failed for selector "${selector}". Expected: ${cptCode}, Got: ${filledValue}`);
+          }
+        }
+      } catch (e) {
+        continue;
+      }
+    }
+    
+    // If not found in main page, try in contentframe iframe
+    if (!cptFilled) {
+      try {
+        const content = page.frameLocator('iframe[name="contentframe"]');
+        for (const selector of rowSelectors) {
+          try {
+            const element = content.locator(selector).first();
+            if (await element.count() > 0) {
+              await element.waitFor({ state: 'visible', timeout: 5000 });
+              await element.scrollIntoViewIfNeeded();
+              await page.waitForTimeout(500);
+              
+              // Clear field and fill with CPT code
+              await element.clear();
+              await element.fill(cptCode);
+              await page.waitForTimeout(1000); // Wait for dropdown to appear
+              
+              // Look for and click on the dropdown option in iframe - target table row structure
+              const dropdownSelectors = [
+                // Target table rows containing CPT codes
+                'tr td div.width60',
+                'tr td .width60',
+                '.ui-autocomplete tr',
+                '.ui-autocomplete li.ui-menu-item',
+                '.ui-autocomplete .ui-menu-item',
+                '.ui-menu .ui-menu-item',
+                '.ui-autocomplete-menu li',
+                '.autocomplete-suggestions div',
+                '.autocomplete-suggestions tr'
+              ];
+              
+              let dropdownClicked = false;
+              for (const dropdownSelector of dropdownSelectors) {
+                try {
+                  const dropdownOptions = content.locator(dropdownSelector);
+                  const optionCount = await dropdownOptions.count();
+                  
+                  if (optionCount > 0) {
+                    log(`Found ${optionCount} iframe dropdown options for CPT ${cptCode}`);
+                    
+                    // Look for the option that contains our CPT code (skip header rows)
+                    for (let j = 0; j < optionCount; j++) {
+                      const option = dropdownOptions.nth(j);
+                      const optionText = await option.textContent();
+                      
+                      if (optionText && optionText.includes(cptCode)) {
+                        // Check if this is a table row structure (div.width60 containing CPT)
+                        if (dropdownSelector.includes('width60') || dropdownSelector.includes('tr')) {
+                          // For table row structure, look for exact CPT match in the div
+                          const cptDiv = option.locator('div.width60, .width60').first();
+                          if (await cptDiv.count() > 0) {
+                            const cptDivText = await cptDiv.textContent();
+                            if (cptDivText && cptDivText.trim() === cptCode) {
+                              // Skip first occurrence (likely header), click on data row
+                              if (j === 0) {
+                                log(`Skipping first iframe row (header) for CPT: ${cptCode}, looking for data row`);
+                                continue;
+                              }
+                              log(`Clicking iframe table data row ${j} for CPT: ${cptCode}`);
+                              await option.scrollIntoViewIfNeeded().catch(() => {});
+                              await page.waitForTimeout(300);
+                              await option.click();
+                              dropdownClicked = true;
+                              break;
+                            }
+                          }
+                        } else {
+                          // For regular dropdown options, ensure CPT code is at the start
+                          if (optionText.trim().startsWith(cptCode)) {
+                            log(`Clicking iframe dropdown option: ${optionText.trim()}`);
+                            await option.scrollIntoViewIfNeeded().catch(() => {});
+                            await page.waitForTimeout(300);
+                            await option.click();
+                            dropdownClicked = true;
+                            break;
+                          } else {
+                            log(`Skipping non-matching iframe option: ${optionText.trim()}`);
+                          }
+                        }
+                      }
+                    }
+                    
+                    if (dropdownClicked) break;
+                  }
+                } catch (e) {
+                  continue;
+                }
+              }
+              
+              if (!dropdownClicked) {
+                log(`No iframe dropdown found or clicked for CPT ${cptCode}, continuing...`);
+              }
+              
+              // Wait after dropdown selection
+              await page.waitForTimeout(500);
+              
+              // Verify the CPT code was filled correctly
+              const filledValue = await element.inputValue();
+              if (filledValue === cptCode) {
+                log(`CPT code ${cptCode} filled with iframe selector "${selector}" ✓ VERIFIED`);
+                console.log(`[CPT FILL] CPT code ${cptCode} filled successfully ✓ VERIFIED`);
+                cptFilled = true;
+                break;
+              } else {
+                log(`CPT verification failed for iframe selector "${selector}". Expected: ${cptCode}, Got: ${filledValue}`);
+              }
+            }
+          } catch (e) {
+            continue;
+          }
+        }
+      } catch (e) {
+        log(`Failed to access contentframe for CPT code: ${e.message}`);
+      }
+    }
+    
+    // If still not found, try all frames
+    if (!cptFilled) {
+      const frames = page.frames();
+      for (const frame of frames) {
+        for (const selector of rowSelectors) {
+          try {
+            const element = frame.locator(selector).first();
+            if (await element.count() > 0) {
+              await element.waitFor({ state: 'visible', timeout: 5000 });
+              await element.scrollIntoViewIfNeeded();
+              await page.waitForTimeout(500);
+              
+              // Clear field and fill with CPT code
+              await element.clear();
+              await element.fill(cptCode);
+              await page.waitForTimeout(1000); // Wait for dropdown to appear
+              
+              // Look for and click on the dropdown option in frame - target table row structure
+              const dropdownSelectors = [
+                // Target table rows containing CPT codes
+                'tr td div.width60',
+                'tr td .width60',
+                '.ui-autocomplete tr',
+                '.ui-autocomplete li.ui-menu-item',
+                '.ui-autocomplete .ui-menu-item',
+                '.ui-menu .ui-menu-item',
+                '.ui-autocomplete-menu li',
+                '.autocomplete-suggestions div',
+                '.autocomplete-suggestions tr'
+              ];
+              
+              let dropdownClicked = false;
+              for (const dropdownSelector of dropdownSelectors) {
+                try {
+                  const dropdownOptions = frame.locator(dropdownSelector);
+                  const optionCount = await dropdownOptions.count();
+                  
+                  if (optionCount > 0) {
+                    log(`Found ${optionCount} frame dropdown options for CPT ${cptCode}`);
+                    
+                    // Look for the option that contains our CPT code (skip header rows)
+                    for (let j = 0; j < optionCount; j++) {
+                      const option = dropdownOptions.nth(j);
+                      const optionText = await option.textContent();
+                      
+                      if (optionText && optionText.includes(cptCode)) {
+                        // Check if this is a table row structure (div.width60 containing CPT)
+                        if (dropdownSelector.includes('width60') || dropdownSelector.includes('tr')) {
+                          // For table row structure, look for exact CPT match in the div
+                          const cptDiv = option.locator('div.width60, .width60').first();
+                          if (await cptDiv.count() > 0) {
+                            const cptDivText = await cptDiv.textContent();
+                            if (cptDivText && cptDivText.trim() === cptCode) {
+                              // Skip first occurrence (likely header), click on data row
+                              if (j === 0) {
+                                log(`Skipping first frame row (header) for CPT: ${cptCode}, looking for data row`);
+                                continue;
+                              }
+                              log(`Clicking frame table data row ${j} for CPT: ${cptCode}`);
+                              await option.scrollIntoViewIfNeeded().catch(() => {});
+                              await page.waitForTimeout(300);
+                              await option.click();
+                              dropdownClicked = true;
+                              break;
+                            }
+                          }
+                        } else {
+                          // For regular dropdown options, ensure CPT code is at the start
+                          if (optionText.trim().startsWith(cptCode)) {
+                            log(`Clicking frame dropdown option: ${optionText.trim()}`);
+                            await option.scrollIntoViewIfNeeded().catch(() => {});
+                            await page.waitForTimeout(300);
+                            await option.click();
+                            dropdownClicked = true;
+                            break;
+                          } else {
+                            log(`Skipping non-matching frame option: ${optionText.trim()}`);
+                          }
+                        }
+                      }
+                    }
+                    
+                    if (dropdownClicked) break;
+                  }
+                } catch (e) {
+                  continue;
+                }
+              }
+              
+              if (!dropdownClicked) {
+                log(`No frame dropdown found or clicked for CPT ${cptCode}, continuing...`);
+              }
+              
+              // Wait after dropdown selection
+              await page.waitForTimeout(500);
+              
+              // Verify the CPT code was filled correctly
+              const filledValue = await element.inputValue();
+              if (filledValue === cptCode) {
+                log(`CPT code ${cptCode} filled with frame selector "${selector}" ✓ VERIFIED`);
+                console.log(`[CPT FILL] CPT code ${cptCode} filled successfully ✓ VERIFIED`);
+                cptFilled = true;
+                break;
+              } else {
+                log(`CPT verification failed for frame selector "${selector}". Expected: ${cptCode}, Got: ${filledValue}`);
+              }
+            }
+          } catch (e) {
+            continue;
+          }
+        }
+        if (cptFilled) break;
+      }
+    }
+    
+    if (!cptFilled) {
+      log(`Failed to fill CPT code: ${cptCode}`);
+      console.log(`[CPT FILL] Failed to fill CPT code: ${cptCode}`);
+    }
+    
+    // Wait between CPT code entries (each goes to a different row)
+    await page.waitForTimeout(1000);
+    
+    log(`Completed CPT code ${cptCode} in row ${i + 1}`);
+  }
+  
+  log(`Completed adding all CPT codes: ${cptCodes.join(', ')}`);
+  console.log(`[CPT FILL] Completed adding all CPT codes: ${cptCodes.join(', ')}`);
+}
+
+
 {
   let claimClicked = false;
   const claimSelectors = [
@@ -1452,7 +2376,7 @@ await page.waitForTimeout(3000);
   if (!claimClicked) {
     log('Could not find Claim button to click');
   } else {
-    await page.waitForTimeout(3000);
+await page.waitForTimeout(3000);
   }
 }
 
